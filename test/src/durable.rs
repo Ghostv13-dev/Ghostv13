@@ -1,0 +1,512 @@
+use serde::Serialize;
+use std::cell::Cell;
+use std::collections::HashMap;
+use std::convert::TryFrom;
+use std::panic::AssertUnwindSafe;
+use std::rc::Rc;
+use std::time::Duration;
+use worker::DurableObject;
+
+use worker::{
+    durable_object,
+    js_sys::{self, Uint8Array},
+    wasm_bindgen::JsValue,
+    Delay, Env, Method, ObjectNamespace, Request, RequestInit, Response, Result, State,
+};
+
+#[durable_object]
+pub struct MyClass {
+    state: State,
+    number: AssertUnwindSafe<Cell<usize>>,
+    ctor_name: Option<String>,
+    // Constructor-gated async-initialization state, exercised by the `/limit` route below.
+    init_runs: AssertUnwindSafe<Rc<Cell<usize>>>,
+    limit: AssertUnwindSafe<Rc<Cell<u64>>>,
+}
+
+impl DurableObject for MyClass {
+    fn new(state: State, _env: Env) -> Self {
+        let ctor_name = state.id().name();
+        let init_runs = Rc::new(Cell::new(0));
+        let limit = Rc::new(Cell::new(0));
+        // The JS constructor idiom: call block_concurrency_while without awaiting it. The
+        // runtime gates delivery of all events until the init future completes, so the first
+        // request must observe the loaded limit, never the 0 sentinel. The delay is a
+        // non-storage await, since storage ops already hold the input gate implicitly.
+        let (runs, l, storage) = (init_runs.clone(), limit.clone(), state.storage());
+        let _init = state.block_concurrency_while(async move {
+            runs.set(runs.get() + 1);
+            Delay::from(Duration::from_millis(200)).await;
+            let stored: u64 = storage.get("limit").await?.unwrap_or(100);
+            storage.put("init_probe", stored).await?;
+            l.set(stored);
+            Ok(())
+        });
+        Self {
+            state,
+            number: AssertUnwindSafe(Cell::new(0)),
+            ctor_name,
+            init_runs: AssertUnwindSafe(init_runs),
+            limit: AssertUnwindSafe(limit),
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn fetch(&self, req: Request) -> Result<Response> {
+        let handler = async move {
+            match req.path().as_str() {
+                "/hello" => {
+                    let name = self
+                        .state
+                        .id()
+                        .name()
+                        .unwrap_or_else(|| "unknown".to_string());
+                    Response::ok(format!("Hello from {name}!"))
+                }
+                "/ctor-name" => {
+                    // Return the name captured in the constructor, verifying it
+                    // is available before any request is handled.
+                    let name = self
+                        .ctor_name
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string());
+                    Response::ok(format!("Hello from {name}!"))
+                }
+                "/storage" => {
+                    let storage = self.state.storage();
+                    let map = [("one".to_string(), 1), ("two".to_string(), 2)]
+                        .iter()
+                        .cloned()
+                        .collect::<HashMap<_, _>>();
+                    storage.put("map", map.clone()).await?;
+                    storage.put("array", [("one", 1), ("two", 2)]).await?;
+                    storage.put("anything", Some(45)).await?;
+
+                    let list = storage.list().await?;
+                    let mut keys = vec![];
+
+                    for key in list.keys() {
+                        let key = key?
+                            .as_string()
+                            .ok_or_else(|| "Key wasn't a string".to_string())?;
+                        if key != "count" {
+                            keys.push(key);
+                        }
+                    }
+
+                    assert_eq!(
+                        keys,
+                        vec!["anything", "array", "map"],
+                        "Didn't list all of the keys: {keys:?}"
+                    );
+                    let vals = storage
+                        .get_multiple(keys)
+                        .await
+                        .map_err(|e| e.to_string() + " -- get_multiple")?;
+                    assert_eq!(
+                        serde_wasm_bindgen::from_value::<Option<i32>>(
+                            vals.get(&"anything".into())
+                        )?,
+                        Some(45),
+                        "Didn't get the right Option<i32> using get_multiple"
+                    );
+                    assert_eq!(
+                        serde_wasm_bindgen::from_value::<[(String, i32); 2]>(
+                            vals.get(&"array".into())
+                        )?,
+                        [("one".to_string(), 1), ("two".to_string(), 2)],
+                        "Didn't get the right array using get_multiple"
+                    );
+                    assert_eq!(
+                        serde_wasm_bindgen::from_value::<HashMap<String, i32>>(
+                            vals.get(&"map".into())
+                        )?,
+                        map,
+                        "Didn't get the right HashMap<String, i32> using get_multiple"
+                    );
+
+                    {
+                        let bytes = Uint8Array::new_with_length(3);
+                        bytes.copy_from(b"123");
+                        storage.put_raw("bytes", bytes).await?;
+                        let bytes = storage
+                            .get::<Vec<u8>>("bytes")
+                            .await?
+                            .expect("get after put yielded nothing");
+                        storage.delete("bytes").await?;
+                        assert_eq!(
+                            bytes, b"123",
+                            "eficient serialization of bytes is not preserved"
+                        );
+                    }
+
+                    #[allow(clippy::items_after_statements)]
+                    #[derive(Serialize)]
+                    struct Stuff {
+                        thing: String,
+                        other: i32,
+                    }
+                    storage
+                        .put_multiple(Stuff {
+                            thing: "Hello there".to_string(),
+                            other: 56,
+                        })
+                        .await?;
+
+                    assert_eq!(
+                        storage
+                            .get::<String>("thing")
+                            .await?
+                            .expect("get('thing') yielded nothing"),
+                        "Hello there",
+                        "Didn't put the right thing with put_multiple"
+                    );
+                    assert_eq!(
+                        storage
+                            .get::<i32>("other")
+                            .await?
+                            .expect("get('other') yielded nothing"),
+                        56,
+                        "Didn't put the right thing with put_multiple"
+                    );
+
+                    storage.delete_multiple(vec!["thing", "other"]).await?;
+
+                    {
+                        const BAR: &[u8] = b"bar";
+                        let obj = js_sys::Object::new();
+                        let value = Uint8Array::new_with_length(u32::try_from(BAR.len()).unwrap());
+                        value.copy_from(BAR);
+                        js_sys::Reflect::set(&obj, &JsValue::from_str("foo"), &value.into())?;
+                        storage.put_multiple_raw(obj).await?;
+                        assert_eq!(
+                            storage
+                                .get::<Vec<u8>>("foo")
+                                .await?
+                                .expect("get('foo') yielded nothing"),
+                            BAR,
+                            "Didn't the right thing with put_multiple_raw"
+                        );
+                    }
+
+                    self.number
+                        .set(storage.get("count").await?.unwrap_or(0) + 1);
+
+                    storage.delete_all().await?;
+
+                    let count = self.number.get();
+                    storage.put("count", count).await?;
+                    Response::ok(self.number.get().to_string())
+                }
+                "/transaction" => {
+                    Response::error("transactional storage API is still unstable", 501)
+                }
+                "/limit" => {
+                    // Reports the constructor-gated init state; see `new()` above.
+                    Response::ok(format!(
+                        "limit:{}:{}",
+                        self.limit.get(),
+                        self.init_runs.get()
+                    ))
+                }
+                "/block-concurrency" => {
+                    // Atomic read-modify-write inside the guard, returning the new count as a
+                    // value out of `block_concurrency_while`.
+                    let storage = self.state.storage();
+                    let count: usize = self
+                        .state
+                        .block_concurrency_while(async move {
+                            let current: usize = storage.get("bcw_count").await?.unwrap_or(0);
+                            let next = current + 1;
+                            storage.put("bcw_count", next).await?;
+                            Ok(next)
+                        })
+                        .await?;
+                    Response::ok(count.to_string())
+                }
+                "/block-concurrency-errors-as-values" => {
+                    // In-memory counter to detect resets: a reset would re-run `new()` and
+                    // drop this back to 1 on the next request.
+                    self.number.set(self.number.get() + 1);
+                    let calls = self.number.get();
+
+                    // Errors returned inside `Ok` are values: they flow back to the caller
+                    // without rejecting the promise, so the object is not reset.
+                    let storage = self.state.storage();
+                    let outcome: std::result::Result<String, String> = self
+                        .state
+                        .block_concurrency_while(async move {
+                            let _seen: Option<usize> =
+                                storage.get("bcw_count").await.ok().flatten();
+                            Ok(Err("simulated transient failure".to_string()))
+                        })
+                        .await?;
+
+                    match outcome {
+                        Ok(value) => Response::ok(format!("ok:{value}:{calls}")),
+                        Err(err) => Response::ok(format!("err:{err}:{calls}")),
+                    }
+                }
+                "/block-concurrency-reset-count" => {
+                    // In-memory counter; a reset re-runs `new()` and drops it back to 1.
+                    self.number.set(self.number.get() + 1);
+                    Response::ok(self.number.get().to_string())
+                }
+                "/block-concurrency-reset-trigger" => {
+                    // Returning `Err` rejects the promise and resets the object.
+                    self.state
+                        .block_concurrency_while(async move {
+                            Err::<(), _>(worker::Error::RustError("intentional reset".into()))
+                        })
+                        .await?;
+                    Response::ok("unreachable")
+                }
+                _ => Response::error("Not Found", 404),
+            }
+        };
+        handler
+            .await
+            .or_else(|err| Response::error(err.to_string(), 500))
+    }
+}
+
+// Second durable object for testing multiple durable objects in the same file
+#[durable_object]
+pub struct AnotherClass {
+    #[allow(unused)]
+    state: State,
+    counter: AssertUnwindSafe<Cell<i32>>,
+}
+
+impl DurableObject for AnotherClass {
+    fn new(state: State, _env: Env) -> Self {
+        Self {
+            state,
+            counter: AssertUnwindSafe(Cell::new(0)),
+        }
+    }
+
+    async fn fetch(&self, _req: Request) -> Result<Response> {
+        self.counter.set(self.counter.get() + 1);
+        Response::ok(format!("Counter: {}", self.counter.get()))
+    }
+}
+
+// Route handlers to exercise the Durable Object from tests.
+#[worker::send]
+pub async fn handle_hello(
+    _req: Request,
+    env: Env,
+    _data: crate::SomeSharedData,
+) -> Result<Response> {
+    let namespace = env.durable_object("MY_CLASS")?;
+    let name = "my-durable-object";
+    let id = namespace.id_from_name(name)?;
+    let stub = id.get_stub()?;
+    stub.fetch_with_str("https://fake-host/hello").await
+}
+
+#[worker::send]
+pub async fn handle_ctor_name(
+    _req: Request,
+    env: Env,
+    _data: crate::SomeSharedData,
+) -> Result<Response> {
+    let namespace = env.durable_object("MY_CLASS")?;
+    let name = "my-durable-object";
+    let id = namespace.id_from_name(name)?;
+    let stub = id.get_stub()?;
+    stub.fetch_with_str("https://fake-host/ctor-name").await
+}
+
+#[worker::send]
+pub async fn handle_hello_unique(
+    _req: Request,
+    env: Env,
+    _data: crate::SomeSharedData,
+) -> Result<Response> {
+    let namespace = env.durable_object("MY_CLASS")?;
+    let id = namespace.unique_id()?;
+    let stub = id.get_stub()?;
+    stub.fetch_with_str("https://fake-host/hello").await
+}
+
+#[worker::send]
+pub async fn handle_storage(
+    _req: Request,
+    env: Env,
+    _data: crate::SomeSharedData,
+) -> Result<Response> {
+    let namespace = env.durable_object("MY_CLASS")?;
+    let stub = namespace.id_from_name("singleton")?.get_stub()?;
+    stub.fetch_with_str("https://fake-host/storage").await
+}
+
+#[worker::send]
+pub async fn handle_basic_test(
+    _req: Request,
+    env: Env,
+    _data: crate::SomeSharedData,
+) -> Result<Response> {
+    let namespace: ObjectNamespace = env.durable_object("MY_CLASS")?;
+    let id = namespace.id_from_name("A")?;
+    assert_eq!(id.name(), Some("A".into()), "Missing name");
+    assert!(
+        namespace.unique_id()?.name().is_none(),
+        "Expected name property to be absent"
+    );
+    let bad = env.durable_object("DFSDF_FAKE_BINDING");
+    assert!(bad.is_err(), "Invalid binding did not raise error");
+
+    let stub = id.get_stub()?;
+    let res = stub
+        .fetch_with_str("https://fake-host/hello")
+        .await?
+        .text()
+        .await?;
+    let res2 = stub
+        .fetch_with_request(Request::new_with_init(
+            "https://fake-host/hello",
+            RequestInit::new()
+                .with_body(Some("lol".into()))
+                .with_method(Method::Post),
+        )?)
+        .await?
+        .text()
+        .await?;
+
+    assert_eq!(res, res2, "Durable object responded wrong to 'hello'");
+
+    let res = stub
+        .fetch_with_str("https://fake-host/storage")
+        .await?
+        .text()
+        .await?;
+    let num = res
+        .parse::<usize>()
+        .map_err(|_| "Durable Object responded wrong to 'storage': ".to_string() + &res)?;
+    let res = stub
+        .fetch_with_str("https://fake-host/storage")
+        .await?
+        .text()
+        .await?;
+    let num2 = res
+        .parse::<usize>()
+        .map_err(|_| "Durable Object responded wrong to 'storage'".to_string())?;
+
+    assert_eq!(num2, num + 1, "Durable object responded wrong to 'storage'");
+
+    let res = stub
+        .fetch_with_str("https://fake-host/transaction")
+        .await?
+        .text()
+        .await?;
+    let num = res
+        .parse::<usize>()
+        .map_err(|_| "Durable Object responded wrong to 'transaction': ".to_string() + &res)?;
+
+    assert_eq!(
+        num,
+        num2 + 1,
+        "Durable object responded wrong to 'transaction'"
+    );
+
+    Response::ok("ok")
+}
+
+#[worker::send]
+pub async fn handle_block_concurrency(
+    _req: Request,
+    env: Env,
+    _data: crate::SomeSharedData,
+) -> Result<Response> {
+    let namespace = env.durable_object("MY_CLASS")?;
+    let stub = namespace.id_from_name("block-concurrency")?.get_stub()?;
+    stub.fetch_with_str("https://fake-host/block-concurrency")
+        .await
+}
+
+#[worker::send]
+pub async fn handle_block_concurrency_reset_count(
+    _req: Request,
+    env: Env,
+    _data: crate::SomeSharedData,
+) -> Result<Response> {
+    let namespace = env.durable_object("MY_CLASS")?;
+    let stub = namespace
+        .id_from_name("block-concurrency-reset")?
+        .get_stub()?;
+    stub.fetch_with_str("https://fake-host/block-concurrency-reset-count")
+        .await
+}
+
+#[worker::send]
+pub async fn handle_block_concurrency_reset_trigger(
+    _req: Request,
+    env: Env,
+    _data: crate::SomeSharedData,
+) -> Result<Response> {
+    let namespace = env.durable_object("MY_CLASS")?;
+    let stub = namespace
+        .id_from_name("block-concurrency-reset")?
+        .get_stub()?;
+    stub.fetch_with_str("https://fake-host/block-concurrency-reset-trigger")
+        .await
+}
+
+#[worker::send]
+pub async fn handle_constructor_init(
+    _req: Request,
+    env: Env,
+    _data: crate::SomeSharedData,
+) -> Result<Response> {
+    let namespace = env.durable_object("MY_CLASS")?;
+    let stub = namespace.id_from_name("constructor-init")?.get_stub()?;
+    stub.fetch_with_str("https://fake-host/limit").await
+}
+
+#[worker::send]
+pub async fn handle_block_concurrency_errors_as_values(
+    _req: Request,
+    env: Env,
+    _data: crate::SomeSharedData,
+) -> Result<Response> {
+    let namespace = env.durable_object("MY_CLASS")?;
+    let stub = namespace
+        .id_from_name("block-concurrency-errors-as-values")?
+        .get_stub()?;
+    stub.fetch_with_str("https://fake-host/block-concurrency-errors-as-values")
+        .await
+}
+
+#[worker::send]
+pub async fn handle_get_by_name(
+    _req: Request,
+    env: Env,
+    _data: crate::SomeSharedData,
+) -> Result<Response> {
+    let namespace = env.durable_object("MY_CLASS")?;
+    let name = "my-durable-object";
+
+    // Using the new get_by_name method - this is equivalent to:
+    // let id = namespace.id_from_name(name)?;
+    // let stub = id.get_stub()?;
+    let stub = namespace.get_by_name(name)?;
+
+    stub.fetch_with_str("https://fake-host/hello").await
+}
+
+#[worker::send]
+pub async fn handle_get_by_name_with_location_hint(
+    _req: Request,
+    env: Env,
+    _data: crate::SomeSharedData,
+) -> Result<Response> {
+    let namespace = env.durable_object("MY_CLASS")?;
+    let name = "my-durable-object";
+
+    // Using the new get_by_name_with_location_hint method
+    let stub = namespace.get_by_name_with_location_hint(name, "enam")?;
+
+    stub.fetch_with_str("https://fake-host/hello").await
+}

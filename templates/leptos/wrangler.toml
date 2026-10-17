@@ -1,0 +1,13 @@
+{% if win -%}
+  {% assign prefix = "set " -%}
+  {% assign suffix = "&&" -%}
+{% endif -%}
+name = "{{project-name}}"
+main = "build/index.js"
+compatibility_date = "{{ "now" | date: "%Y-%m-%d" }}"
+
+[build]
+command = "cargo leptos build --release && cargo install -q \"worker-build@^0.8\" && {{prefix}}LEPTOS_OUTPUT_NAME={{project-name}}{{suffix}} worker-build --release --features ssr"
+
+[assets]
+directory = "./target/site"

@@ -1,0 +1,36 @@
+{
+  "dependencies": {
+    "@changesets/changelog-github": "^1.0.0",
+    "@changesets/cli": "^3.0.0",
+    "@cloudflare/workers-types": "^5.20260818.1"
+  },
+  "name": "workers-rs",
+  "version": "0.0.12",
+  "author": "workers-rs@cloudflare.com",
+  "description": "Monorepo for Worker Rust Bindings",
+  "license": "MIT OR Apache-2.0",
+  "bugs": {
+    "url": "https://github.com/cloudflare/workers-rs/issues"
+  },
+  "homepage": "https://github.com/cloudflare/workers-rs#readme",
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "miniflare": "5.20260923.0-alpha",
+    "typescript": "^7.0.2",
+    "uuid": "^14.0.2",
+    "vitest": "^4.1.11"
+  },
+  "scripts": {
+    "build": "cd wasm-bindgen && cargo build -p wasm-bindgen-cli --bin wasm-bindgen && cd .. && cargo build -p worker-build",
+    "bench": "cd benchmark && node --run build && node --run bench",
+    "test": "cd test && NO_MINIFY=1 WASM_BINDGEN_BIN=../wasm-bindgen/target/debug/wasm-bindgen ../target/debug/worker-build --dev && WORKERD_ALL_AUTOGATES=1 NODE_OPTIONS='--experimental-vm-modules' npx vitest run",
+    "test-http": "cd test && NO_MINIFY=1 WASM_BINDGEN_BIN=../wasm-bindgen/target/debug/wasm-bindgen ../target/debug/worker-build --release --features http && WORKERD_ALL_AUTOGATES=1 NODE_OPTIONS='--experimental-vm-modules' npx vitest run",
+    "test-panic-unwind": "cd test && NO_MINIFY=1 WASM_BINDGEN_BIN=../wasm-bindgen/target/debug/wasm-bindgen ../target/debug/worker-build --dev --panic-unwind && WORKERD_ALL_AUTOGATES=1 NODE_OPTIONS='--experimental-vm-modules' npx vitest run",
+    "test-mem": "cd test && npx wrangler dev --enable-containers=false",
+    "lint": "cargo clippy --features d1,queue --all-targets --workspace -- -D warnings",
+    "lint:fix": "cargo fmt && cargo clippy --features d1,queue --all-targets --workspace --fix -- -D warnings"
+  },
+  "allowScripts": {
+    "workerd@1.20260923.1": true
+  }
+}

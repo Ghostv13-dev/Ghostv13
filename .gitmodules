@@ -1,0 +1,6 @@
+[submodule "wasm-bindgen"]
+	path = wasm-bindgen
+	url = https://github.com/wasm-bindgen/wasm-bindgen
+[submodule "ts-gen"]
+	path = ts-gen
+	url = https://github.com/wasm-bindgen/ts-gen

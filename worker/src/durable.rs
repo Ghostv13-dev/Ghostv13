@@ -1,0 +1,1042 @@
+//! Durable Objects provide low-latency coordination and consistent storage for the Workers platform.
+//! A given namespace can support essentially unlimited Durable Objects, with each Object having
+//! access to a transactional, key-value storage API.
+//!
+//! Durable Objects consist of two components: a class that defines a template for creating Durable
+//! Objects and a Workers script that instantiates and uses those Durable Objects.
+//!
+//! The class and the Workers script are linked together with a binding.
+//!
+//! [Learn more](https://developers.cloudflare.com/workers/learning/using-durable-objects) about
+//! using Durable Objects.
+
+use std::{
+    cell::RefCell, fmt::Display, ops::Deref, panic::AssertUnwindSafe, rc::Rc, time::Duration,
+};
+
+use crate::r2::js_object;
+use crate::{
+    container::Container,
+    date::Date,
+    env::{Env, EnvBinding},
+    error::Error,
+    request::Request,
+    response::Response,
+    Result, Socket, WebSocket,
+};
+use js_sys::{Boolean as JsBoolean, JsString, Object as JsObject};
+
+use chrono::{DateTime, Utc};
+use futures_util::Future;
+use js_sys::futures::{future_to_promise, JsFuture};
+use js_sys::{Map, Number, Object};
+use serde::{de::DeserializeOwned, Serialize};
+use wasm_bindgen::{prelude::*, JsCast};
+use worker_sys::{
+    DurableObject as EdgeDurableObject, DurableObjectId,
+    DurableObjectNamespace as EdgeObjectNamespace, DurableObjectState, DurableObjectStorage,
+    DurableObjectTransaction,
+};
+
+/// A Durable Object stub is a client object used to send requests to a remote Durable Object.
+#[derive(Debug)]
+pub struct Stub {
+    inner: EdgeDurableObject,
+}
+
+unsafe impl Send for Stub {}
+unsafe impl Sync for Stub {}
+
+impl Stub {
+    /// Send an internal Request to the Durable Object to which the stub points.
+    pub async fn fetch_with_request(&self, req: Request) -> Result<Response> {
+        let promise = self.inner.fetch_with_request(req.inner())?;
+        let response = JsFuture::from(promise).await?;
+        Ok(response.dyn_into::<web_sys::Response>()?.into())
+    }
+
+    /// Construct a Request from a URL to the Durable Object to which the stub points.
+    pub async fn fetch_with_str(&self, url: &str) -> Result<Response> {
+        let promise = self.inner.fetch_with_str(url)?;
+        let response = JsFuture::from(promise).await?;
+        Ok(response.dyn_into::<web_sys::Response>()?.into())
+    }
+
+    /// Opens a TCP connection to the Durable Object, served by its
+    /// [`DurableObject::connect`] handler. `address` is the `host:port` the
+    /// object sees as the connection's local address.
+    pub fn connect(&self, address: &str) -> Result<Socket> {
+        let options: JsValue = js_object!(
+            "allowHalfOpen" => JsBoolean::from(true)
+        )
+        .into();
+        Ok(Socket::new(self.inner.connect(address, options)?))
+    }
+
+    pub fn into_rpc<T: JsCast>(self) -> T {
+        self.inner.unchecked_into()
+    }
+}
+
+/// Use an ObjectNamespace to get access to Stubs for communication with a Durable Object instance.
+/// A given namespace can support essentially unlimited Durable Objects, with each Object having
+/// access to a transactional, key-value storage API.
+#[derive(Debug, Clone)]
+pub struct ObjectNamespace {
+    inner: EdgeObjectNamespace,
+}
+
+unsafe impl Send for ObjectNamespace {}
+unsafe impl Sync for ObjectNamespace {}
+
+impl ObjectNamespace {
+    /// This method derives a unique object ID from the given name string. It will always return the
+    /// same ID when given the same name as input.
+    pub fn id_from_name(&self, name: &str) -> Result<ObjectId<'_>> {
+        self.inner
+            .id_from_name(name)
+            .map_err(Error::from)
+            .map(|id| ObjectId {
+                inner: id,
+                namespace: Some(self),
+            })
+    }
+
+    /// This method parses an ID that was previously stringified. This is useful in particular with
+    /// IDs created using `unique_id(&self)`, as these IDs need to be stored somewhere, probably as
+    // as a string.
+    ///
+    /// A stringified object ID is a 64-digit hexadecimal number. However, not all 64-digit hex
+    /// numbers are valid IDs. This method will throw if it is passed an ID that was not originally
+    /// created by newUniqueId() or idFromName(). It will also throw if the ID was originally
+    /// created for a different namespace.
+    pub fn id_from_string(&self, hex_id: &str) -> Result<ObjectId<'_>> {
+        self.inner
+            .id_from_string(hex_id)
+            .map_err(Error::from)
+            .map(|id| ObjectId {
+                inner: id,
+                namespace: Some(self),
+            })
+    }
+
+    /// Creates a new object ID randomly. This method will never return the same ID twice, and thus
+    /// it is guaranteed that the object does not yet exist and has never existed at the time the
+    /// method returns.
+    pub fn unique_id(&self) -> Result<ObjectId<'_>> {
+        self.inner
+            .new_unique_id()
+            .map_err(Error::from)
+            .map(|id| ObjectId {
+                inner: id,
+                namespace: Some(self),
+            })
+    }
+
+    /// Durable Objects can be created so that they only run and store data within a specific
+    /// jurisdiction to comply with local regulations. You must specify the jurisdiction when
+    /// generating the Durable Object's id.
+    ///
+    /// Jurisdiction constraints can only be used with ids created by `unique_id()` and are not
+    /// currently compatible with ids created by `id_from_name()`.
+    ///
+    /// See supported jurisdictions and more documentation at:
+    /// <https://developers.cloudflare.com/durable-objects/reference/data-location/#restrict-durable-objects-to-a-jurisdiction>
+    pub fn unique_id_with_jurisdiction(&self, jd: &str) -> Result<ObjectId<'_>> {
+        let options = Object::new();
+        js_sys::Reflect::set(&options, &JsValue::from("jurisdiction"), &jd.into())?;
+        self.inner
+            .new_unique_id_with_options(&options)
+            .map_err(Error::from)
+            .map(|id| ObjectId {
+                inner: id,
+                namespace: Some(self),
+            })
+    }
+
+    /// Get a Durable Object stub directly by name. This combines the functionality of
+    /// `id_from_name()` and `get_stub()` into a single method call.
+    pub fn get_by_name(&self, name: &str) -> Result<Stub> {
+        self.inner
+            .get_by_name(name)
+            .map_err(Error::from)
+            .map(|stub| Stub { inner: stub })
+    }
+
+    /// Get a Durable Object stub directly by name with options (such as location hints).
+    /// This combines the functionality of `id_from_name()` and `get_stub_with_location_hint()`
+    /// into a single method call.
+    pub fn get_by_name_with_location_hint(&self, name: &str, location_hint: &str) -> Result<Stub> {
+        let options = Object::new();
+        js_sys::Reflect::set(
+            &options,
+            &JsValue::from("locationHint"),
+            &location_hint.into(),
+        )?;
+        self.inner
+            .get_by_name_with_options(name, &options)
+            .map_err(Error::from)
+            .map(|stub| Stub { inner: stub })
+    }
+}
+
+/// An ObjectId is used to identify, locate, and access a Durable Object via interaction with its
+/// Stub.
+#[derive(Debug)]
+pub struct ObjectId<'a> {
+    inner: DurableObjectId,
+    namespace: Option<&'a ObjectNamespace>,
+}
+
+impl ObjectId<'_> {
+    /// Get a Stub for the Durable Object instance identified by this ObjectId.
+    pub fn get_stub(&self) -> Result<Stub> {
+        self.namespace
+            .ok_or_else(|| JsValue::from("Cannot get stub from within a Durable Object"))
+            .and_then(|n| {
+                Ok(Stub {
+                    inner: n.inner.get(&self.inner)?,
+                })
+            })
+            .map_err(Error::from)
+    }
+
+    pub fn get_stub_with_location_hint(&self, location_hint: &str) -> Result<Stub> {
+        let options = Object::new();
+        js_sys::Reflect::set(
+            &options,
+            &JsValue::from("locationHint"),
+            &location_hint.into(),
+        )?;
+
+        self.namespace
+            .ok_or_else(|| JsValue::from("Cannot get stub from within a Durable Object"))
+            .and_then(|n| {
+                Ok(Stub {
+                    inner: n.inner.get_with_options(&self.inner, &options)?,
+                })
+            })
+            .map_err(Error::from)
+    }
+
+    /// The name that was used to create the `ObjectId` via [`id_from_name`](https://developers.cloudflare.com/durable-objects/api/namespace/#idfromname).
+    ///
+    /// When a Durable Object is addressed by name, the name is also passed
+    /// through to the object itself and is available via `state.id().name()`,
+    /// including inside the constructor and [`alarm`](crate::DurableObject::alarm)
+    /// handlers (see <https://github.com/cloudflare/workerd/issues/2240>).
+    ///
+    /// `None` is returned in some cases, for example when the `ObjectId` was
+    /// constructed via [`unique_id`](https://developers.cloudflare.com/durable-objects/api/namespace/#newuniqueid).
+    /// See the [Durable Object ID docs](https://developers.cloudflare.com/durable-objects/api/id/#name)
+    /// for the full list of cases.
+    pub fn name(&self) -> Option<String> {
+        self.inner.name()
+    }
+}
+
+impl PartialEq for ObjectId<'_> {
+    /// Compare equality between two ObjectIds using [`equals`](<https://developers.cloudflare.com/durable-objects/api/id/#equals>).
+    /// <div class="warning">The equality check ignores the namespace.</div>
+    fn eq(&self, other: &Self) -> bool {
+        self.inner.equals(&other.inner)
+    }
+}
+
+impl Display for ObjectId<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
+        write!(
+            f,
+            "{}",
+            self.inner.to_string().map_err(|_| { std::fmt::Error })?
+        )
+    }
+}
+
+/// Passed from the runtime to provide access to the Durable Object's storage as well as various
+/// metadata about the Object.
+#[derive(Debug)]
+pub struct State {
+    inner: DurableObjectState,
+}
+
+impl State {
+    /// The ID of this Durable Object which can be converted into a hex string using its `to_string()`
+    /// method.
+    pub fn id(&self) -> ObjectId<'_> {
+        ObjectId {
+            inner: self.inner.id().unwrap(),
+            namespace: None,
+        }
+    }
+
+    /// Contains methods for accessing persistent storage via the transactional storage API. See
+    /// [Transactional Storage API](https://developers.cloudflare.com/workers/runtime-apis/durable-objects#transactional-storage-api) for a detailed reference.
+    pub fn storage(&self) -> Storage {
+        Storage {
+            inner: self.inner.storage().unwrap(),
+        }
+    }
+
+    pub fn container(&self) -> Option<Container> {
+        self.inner.container().map(|inner| Container { inner })
+    }
+
+    /// The underlying `DurableObjectState`, for JavaScript APIs that take it
+    /// directly.
+    pub fn as_raw(&self) -> &DurableObjectState {
+        &self.inner
+    }
+
+    pub fn wait_until<F>(&self, future: F)
+    where
+        F: Future<Output = ()> + 'static,
+    {
+        self.inner
+            .wait_until(&future_to_promise(AssertUnwindSafe(async {
+                future.await;
+                Ok(JsValue::UNDEFINED)
+            })))
+            .unwrap()
+    }
+
+    /// Runs a future while blocking delivery of any other events to the Durable Object until it
+    /// completes, guaranteeing ordering. Binds the runtime's
+    /// [`blockConcurrencyWhile`](https://developers.cloudflare.com/durable-objects/api/state/#blockconcurrencywhile),
+    /// with the same call-time semantics as JavaScript: the gate closes as a side effect of the
+    /// *call*, and the returned future only observes completion.
+    ///
+    /// Awaiting the returned future yields the inner future's value. Discarding it instead gives
+    /// the JavaScript constructor idiom, gating all event delivery until async initialization
+    /// completes. Bind it to a `_`-prefixed name: the `unused_must_use` and clippy
+    /// `let_underscore_future` lints do not apply here since the gate is already active:
+    ///
+    /// ```no_run
+    /// # use std::{cell::Cell, rc::Rc};
+    /// # use worker::*;
+    /// # fn example(state: State) {
+    /// let limit = Rc::new(Cell::new(0));
+    /// let (l, storage) = (limit.clone(), state.storage());
+    /// let _init = state.block_concurrency_while(async move {
+    ///     l.set(storage.get("limit").await?.unwrap_or(100));
+    ///     Ok(())
+    /// });
+    /// # }
+    /// ```
+    ///
+    /// **If the future returns `Err`, the Durable Object is terminated and reset**, as with
+    /// throwing in the JavaScript callback. To treat errors as values instead, return them inside
+    /// `Ok` (`T = Result<Outcome, MyError>`). The runtime also resets the object if the future
+    /// exceeds a 30 second timeout.
+    ///
+    /// The future must be `'static`, so it cannot borrow `&self`; move owned values (such as
+    /// `state.storage()` or a cloned `Env`) in instead.
+    ///
+    /// # Errors
+    ///
+    /// Errors if the `blockConcurrencyWhile` call fails, the future returns `Err`, or the callback
+    /// does not run.
+    pub fn block_concurrency_while<F, T>(&self, future: F) -> impl Future<Output = Result<T>>
+    where
+        F: Future<Output = Result<T>> + 'static,
+        T: 'static,
+    {
+        let output: Rc<RefCell<Option<T>>> = Rc::new(RefCell::new(None));
+        let slot = output.clone();
+        let callback = wasm_bindgen::closure::Closure::once_into_js(AssertUnwindSafe(move || {
+            future_to_promise(AssertUnwindSafe(async move {
+                let value = future.await.map_err(JsValue::from)?;
+                *slot.borrow_mut() = Some(value);
+                Ok(JsValue::NULL)
+            }))
+        }));
+        let promise = self.inner.block_concurrency_while(callback.unchecked_ref());
+        async move {
+            JsFuture::from(promise?).await.map_err(Error::from)?;
+            let value = output.borrow_mut().take();
+            value.ok_or_else(|| {
+                Error::RustError("block_concurrency_while callback did not run".into())
+            })
+        }
+    }
+
+    // needs to be accessed by the `#[durable_object]` macro in a conversion step
+    pub fn _inner(self) -> DurableObjectState {
+        self.inner
+    }
+
+    pub fn accept_web_socket(&self, ws: &WebSocket) {
+        self.inner.accept_websocket(ws.as_ref()).unwrap()
+    }
+
+    pub fn accept_websocket_with_tags(&self, ws: &WebSocket, tags: &[&str]) {
+        let tags = tags.iter().map(|it| (*it).into()).collect();
+
+        self.inner
+            .accept_websocket_with_tags(ws.as_ref(), tags)
+            .unwrap();
+    }
+
+    pub fn get_websockets(&self) -> Vec<WebSocket> {
+        self.inner
+            .get_websockets()
+            .unwrap()
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
+
+    pub fn get_websockets_with_tag(&self, tag: &str) -> Vec<WebSocket> {
+        self.inner
+            .get_websockets_with_tag(tag)
+            .unwrap()
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
+
+    /// Retrieve tags from a hibernatable websocket
+    pub fn get_tags(&self, websocket: &WebSocket) -> Vec<String> {
+        self.inner.get_tags(websocket.as_ref()).unwrap()
+    }
+
+    pub fn set_websocket_auto_response(&self, pair: &worker_sys::WebSocketRequestResponsePair) {
+        self.inner.set_websocket_auto_response(pair).unwrap();
+    }
+
+    pub fn get_websocket_auto_response(&self) -> Option<worker_sys::WebSocketRequestResponsePair> {
+        self.inner.get_websocket_auto_response().unwrap()
+    }
+}
+
+impl From<DurableObjectState> for State {
+    fn from(o: DurableObjectState) -> Self {
+        Self { inner: o }
+    }
+}
+
+/// Access a Durable Object's Storage API. Each method is implicitly wrapped inside a transaction,
+/// such that its results are atomic and isolated from all other storage operations, even when
+/// accessing multiple key-value pairs.
+pub struct Storage {
+    inner: DurableObjectStorage,
+}
+
+impl core::fmt::Debug for Storage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Storage").finish()
+    }
+}
+
+impl Storage {
+    /// Retrieves the value associated with the given key. The type of the returned value will be
+    /// whatever was previously written for the key.
+    ///
+    /// Returns `Ok(None)` if the key does not exist.
+    pub async fn get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
+        let res = match JsFuture::from(self.inner.get(key)?).await {
+            // If we successfully retrived `undefined`, that means the key doesn't exist
+            Ok(val) if val.is_undefined() => Ok(None),
+            // Otherwise deserialize whatever we successfully received
+            Ok(val) => {
+                serde_wasm_bindgen::from_value(val).map_err(|e| JsValue::from(e.to_string()))
+            }
+            // Forward any error, rewrap to make the typechecker happy
+            Err(e) => Err(e),
+        };
+
+        res.map_err(Error::from)
+    }
+
+    /// Retrieves the values associated with each of the provided keys.
+    pub async fn get_multiple(&self, keys: Vec<impl Deref<Target = str>>) -> Result<Map> {
+        let keys = self.inner.get_multiple(
+            keys.into_iter()
+                .map(|key| JsValue::from(key.deref()))
+                .collect(),
+        )?;
+        let keys = JsFuture::from(keys).await?;
+        keys.dyn_into::<Map>().map_err(Error::from)
+    }
+
+    /// Stores the value and associates it with the given key.
+    pub async fn put<T: Serialize>(&self, key: &str, value: T) -> Result<()> {
+        self.put_raw(key, serde_wasm_bindgen::to_value(&value)?)
+            .await
+    }
+
+    pub async fn put_raw(&self, key: &str, value: impl Into<JsValue>) -> Result<()> {
+        JsFuture::from(self.inner.put(key, value.into())?)
+            .await
+            .map_err(Error::from)
+            .map(|_| ())
+    }
+
+    /// Takes a serializable struct and stores each of its keys and values to storage.
+    pub async fn put_multiple<T: Serialize>(&self, values: T) -> Result<()> {
+        let values = serde_wasm_bindgen::to_value(&values)?;
+        if !values.is_object() {
+            return Err("Must pass in a struct type".to_string().into());
+        }
+        self.put_multiple_raw(values.dyn_into().unwrap()).await
+    }
+
+    /// Takes an object and stores each of its keys and values to storage.
+    ///
+    /// ```no_run
+    /// # use worker::{js_sys, Storage};
+    /// use worker::wasm_bindgen::JsValue;
+    ///
+    /// # async fn example(storage: Storage) -> worker::Result<()> {
+    /// let obj = js_sys::Object::new();
+    /// js_sys::Reflect::set(&obj, &JsValue::from_str("foo"), &JsValue::from_f64(1.0))?;
+    ///
+    /// storage.put_multiple_raw(obj).await
+    /// # }
+    /// ```
+    pub async fn put_multiple_raw(&self, values: Object) -> Result<()> {
+        JsFuture::from(self.inner.put_multiple(values.into())?)
+            .await
+            .map_err(Error::from)
+            .map(|_| ())
+    }
+
+    /// Deletes the key and associated value. Returns true if the key existed or false if it didn't.
+    pub async fn delete(&self, key: &str) -> Result<bool> {
+        let fut: JsFuture = self.inner.delete(key)?.into();
+        fut.await
+            .and_then(|jsv| {
+                jsv.as_bool()
+                    .ok_or_else(|| JsValue::from("Promise did not return bool"))
+            })
+            .map_err(Error::from)
+    }
+
+    /// Deletes the provided keys and their associated values. Returns a count of the number of
+    /// key-value pairs deleted.
+    pub async fn delete_multiple(&self, keys: Vec<impl Deref<Target = str>>) -> Result<usize> {
+        let fut: JsFuture = self
+            .inner
+            .delete_multiple(
+                keys.into_iter()
+                    .map(|key| JsValue::from(key.deref()))
+                    .collect(),
+            )?
+            .into();
+        fut.await
+            .and_then(|jsv| {
+                jsv.as_f64()
+                    .map(|f| f as usize)
+                    .ok_or_else(|| JsValue::from("Promise did not return number"))
+            })
+            .map_err(Error::from)
+    }
+
+    /// Deletes all keys and associated values, effectively deallocating all storage used by the
+    /// Durable Object. In the event of a failure while the operation is still in flight, it may be
+    /// that only a subset of the data is properly deleted.
+    pub async fn delete_all(&self) -> Result<()> {
+        let fut: JsFuture = self.inner.delete_all()?.into();
+        fut.await.map(|_| ()).map_err(Error::from)
+    }
+
+    /// Returns all keys and values associated with the current Durable Object in ascending
+    /// lexicographic sorted order.
+    ///
+    /// Be aware of how much data may be stored in your Durable Object before calling this version
+    /// of list without options, because it will all be loaded into the Durable Object's memory,
+    /// potentially hitting its [limit](https://developers.cloudflare.com/workers/platform/limits#durable-objects-limits).
+    /// If that is a concern, use the alternate `list_with_options()` method.
+    pub async fn list(&self) -> Result<Map> {
+        let fut: JsFuture = self.inner.list()?.into();
+        fut.await
+            .and_then(|jsv| jsv.dyn_into())
+            .map_err(Error::from)
+    }
+
+    /// Returns keys associated with the current Durable Object according to the parameters in the
+    /// provided options object.
+    pub async fn list_with_options(&self, opts: ListOptions<'_>) -> Result<Map> {
+        let fut: JsFuture = self
+            .inner
+            .list_with_options(serde_wasm_bindgen::to_value(&opts)?.into())?
+            .into();
+        fut.await
+            .and_then(|jsv| jsv.dyn_into())
+            .map_err(Error::from)
+    }
+
+    /// Retrieves the current alarm time (if set) as integer milliseconds since epoch.
+    /// The alarm is considered to be set if it has not started, or if it has failed
+    /// and any retry has not begun. If no alarm is set, `get_alarm()` returns `None`.
+    pub async fn get_alarm(&self) -> Result<Option<i64>> {
+        let fut: JsFuture = self.inner.get_alarm(JsValue::NULL.into())?.into();
+        fut.await
+            .map(|jsv| jsv.as_f64().map(|f| f as i64))
+            .map_err(Error::from)
+    }
+
+    pub async fn get_alarm_with_options(&self, options: GetAlarmOptions) -> Result<Option<i64>> {
+        let fut: JsFuture = self
+            .inner
+            .get_alarm(serde_wasm_bindgen::to_value(&options)?.into())?
+            .into();
+        fut.await
+            .map(|jsv| jsv.as_f64().map(|f| f as i64))
+            .map_err(Error::from)
+    }
+
+    /// Sets the current alarm time to the given datetime.
+    ///
+    /// If `set_alarm()` is called with a time equal to or before Date.now(), the alarm
+    /// will be scheduled for asynchronous execution in the immediate future. If the
+    /// alarm handler is currently executing in this case, it will not be canceled.
+    /// Alarms can be set to millisecond granularity and will usually execute within
+    /// a few milliseconds after the set time, but can be delayed by up to a minute
+    /// due to maintenance or failures while failover takes place.
+    pub async fn set_alarm(&self, scheduled_time: impl Into<ScheduledTime>) -> Result<()> {
+        let fut: JsFuture = self
+            .inner
+            .set_alarm(scheduled_time.into().schedule(), JsValue::NULL.into())?
+            .into();
+        fut.await.map(|_| ()).map_err(Error::from)
+    }
+
+    pub async fn set_alarm_with_options(
+        &self,
+        scheduled_time: impl Into<ScheduledTime>,
+        options: SetAlarmOptions,
+    ) -> Result<()> {
+        let fut: JsFuture = self
+            .inner
+            .set_alarm(
+                scheduled_time.into().schedule(),
+                serde_wasm_bindgen::to_value(&options)?.into(),
+            )?
+            .into();
+        fut.await.map(|_| ()).map_err(Error::from)
+    }
+
+    /// Deletes the alarm if one exists. Does not cancel the alarm handler if it is
+    /// currently executing.
+    pub async fn delete_alarm(&self) -> Result<()> {
+        let fut: JsFuture = self.inner.delete_alarm(JsValue::NULL.into())?.into();
+        fut.await.map(|_| ()).map_err(Error::from)
+    }
+
+    pub async fn delete_alarm_with_options(&self, options: SetAlarmOptions) -> Result<()> {
+        let fut: JsFuture = self
+            .inner
+            .delete_alarm(serde_wasm_bindgen::to_value(&options)?.into())?
+            .into();
+        fut.await.map(|_| ()).map_err(Error::from)
+    }
+
+    pub async fn transaction<F, Fut>(&self, closure: F) -> Result<()>
+    where
+        F: FnOnce(Transaction) -> Fut + 'static,
+        Fut: Future<Output = Result<()>> + 'static,
+    {
+        let inner: Box<dyn FnOnce(DurableObjectTransaction) -> js_sys::Promise> =
+            Box::new(move |t: DurableObjectTransaction| -> js_sys::Promise {
+                future_to_promise(AssertUnwindSafe(async move {
+                    closure(Transaction { inner: t })
+                        .await
+                        .map_err(JsValue::from)
+                        .map(|_| JsValue::NULL)
+                }))
+            });
+        let clos = wasm_bindgen::closure::Closure::once_assert_unwind_safe(inner);
+        JsFuture::from(self.inner.transaction(&clos)?)
+            .await
+            .map_err(Error::from)
+            .map(|_| ())
+    }
+
+    // Add new method to access SQLite APIs
+    pub fn sql(&self) -> crate::sql::SqlStorage {
+        crate::sql::SqlStorage::new(self.inner.sql())
+    }
+
+    /// Waits for all writes issued so far to be committed to disk. Binds
+    /// [`storage.sync()`](https://developers.cloudflare.com/durable-objects/api/storage-api/#sync).
+    pub async fn sync(&self) -> Result<()> {
+        JsFuture::from(self.inner.sync()?).await?;
+        Ok(())
+    }
+
+    /// The underlying `DurableObjectStorage`, for JavaScript APIs that take it
+    /// directly.
+    pub fn as_raw(&self) -> &DurableObjectStorage {
+        &self.inner
+    }
+}
+
+#[derive(Debug)]
+pub struct Transaction {
+    inner: DurableObjectTransaction,
+}
+
+impl Transaction {
+    pub async fn get<T: DeserializeOwned>(&self, key: &str) -> Result<T> {
+        JsFuture::from(self.inner.get(key)?)
+            .await
+            .and_then(|val| {
+                if val.is_undefined() {
+                    Err(JsValue::from("No such value in storage."))
+                } else {
+                    serde_wasm_bindgen::from_value(val).map_err(std::convert::Into::into)
+                }
+            })
+            .map_err(Error::from)
+    }
+
+    pub async fn get_multiple(&self, keys: Vec<impl Deref<Target = str>>) -> Result<Map> {
+        let keys = self.inner.get_multiple(
+            keys.into_iter()
+                .map(|key| JsValue::from(key.deref()))
+                .collect(),
+        )?;
+        let keys = JsFuture::from(keys).await?;
+        keys.dyn_into::<Map>().map_err(Error::from)
+    }
+
+    pub async fn put<T: Serialize>(&self, key: &str, value: T) -> Result<()> {
+        JsFuture::from(self.inner.put(key, serde_wasm_bindgen::to_value(&value)?)?)
+            .await
+            .map_err(Error::from)
+            .map(|_| ())
+    }
+
+    // Each key-value pair in the serialized object will be added to the storage
+    pub async fn put_multiple<T: Serialize>(&self, values: T) -> Result<()> {
+        let values = serde_wasm_bindgen::to_value(&values)?;
+        if !values.is_object() {
+            return Err("Must pass in a struct type".to_string().into());
+        }
+        JsFuture::from(self.inner.put_multiple(values)?)
+            .await
+            .map_err(Error::from)
+            .map(|_| ())
+    }
+
+    pub async fn delete(&self, key: &str) -> Result<bool> {
+        let fut: JsFuture = self.inner.delete(key)?.into();
+        fut.await
+            .and_then(|jsv| {
+                jsv.as_bool()
+                    .ok_or_else(|| JsValue::from("Promise did not return bool"))
+            })
+            .map_err(Error::from)
+    }
+
+    pub async fn delete_multiple(&self, keys: Vec<impl Deref<Target = str>>) -> Result<usize> {
+        let fut: JsFuture = self
+            .inner
+            .delete_multiple(
+                keys.into_iter()
+                    .map(|key| JsValue::from(key.deref()))
+                    .collect(),
+            )?
+            .into();
+        fut.await
+            .and_then(|jsv| {
+                jsv.as_f64()
+                    .map(|f| f as usize)
+                    .ok_or_else(|| JsValue::from("Promise did not return number"))
+            })
+            .map_err(Error::from)
+    }
+
+    pub async fn delete_all(&self) -> Result<()> {
+        let fut: JsFuture = self.inner.delete_all()?.into();
+        fut.await.map(|_| ()).map_err(Error::from)
+    }
+
+    pub async fn list(&self) -> Result<Map> {
+        let fut: JsFuture = self.inner.list()?.into();
+        fut.await
+            .and_then(|jsv| jsv.dyn_into())
+            .map_err(Error::from)
+    }
+
+    pub async fn list_with_options(&self, opts: ListOptions<'_>) -> Result<Map> {
+        let fut: JsFuture = self
+            .inner
+            .list_with_options(serde_wasm_bindgen::to_value(&opts)?.into())?
+            .into();
+        fut.await
+            .and_then(|jsv| jsv.dyn_into())
+            .map_err(Error::from)
+    }
+
+    pub fn rollback(&self) -> Result<()> {
+        self.inner.rollback().map_err(Error::from)
+    }
+}
+
+#[derive(Default, Serialize, Debug)]
+pub struct ListOptions<'a> {
+    /// Key at which the list results should start, inclusive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start: Option<&'a str>,
+    /// Key at which the list results should end, exclusive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end: Option<&'a str>,
+    /// Restricts results to only include key-value pairs whose keys begin with the prefix.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prefix: Option<&'a str>,
+    /// If true, return results in descending lexicographic order instead of the default ascending
+    /// order.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reverse: Option<bool>,
+    /// Maximum number of key-value pairs to return.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit: Option<usize>,
+}
+
+impl<'a> ListOptions<'a> {
+    /// Create a new ListOptions struct with no options set.
+    pub fn new() -> Self {
+        Default::default()
+    }
+
+    /// Key at which the list results should start, inclusive.
+    pub fn start(mut self, val: &'a str) -> Self {
+        self.start = Some(val);
+        self
+    }
+
+    /// Key at which the list results should end, exclusive.
+    pub fn end(mut self, val: &'a str) -> Self {
+        self.end = Some(val);
+        self
+    }
+
+    /// Restricts results to only include key-value pairs whose keys begin with the prefix.
+    pub fn prefix(mut self, val: &'a str) -> Self {
+        self.prefix = Some(val);
+        self
+    }
+
+    /// If true, return results in descending lexicographic order instead of the default ascending
+    /// order.
+    pub fn reverse(mut self, val: bool) -> Self {
+        self.reverse = Some(val);
+        self
+    }
+
+    /// Maximum number of key-value pairs to return.
+    pub fn limit(mut self, val: usize) -> Self {
+        self.limit = Some(val);
+        self
+    }
+}
+#[derive(Debug)]
+enum ScheduledTimeInit {
+    Date(js_sys::Date),
+    Offset(f64),
+}
+
+/// Determines when a Durable Object alarm should be ran, based on a timestamp or offset in milliseconds.
+///
+/// Implements [`From`] for:
+/// - [`Duration`], interpreted as an offset (in milliseconds).
+/// - [`i64`], interpreted as an offset (in milliseconds).
+/// - [`DateTime`], interpreted as a timestamp.
+///
+/// When an offset is used, the time at which `set_alarm()` or `set_alarm_with_options()` is called
+/// is used to compute the scheduled time. [`Date::now`] is used as the current time.
+#[derive(Debug)]
+pub struct ScheduledTime {
+    init: ScheduledTimeInit,
+}
+
+impl ScheduledTime {
+    pub fn new(date: js_sys::Date) -> Self {
+        Self {
+            init: ScheduledTimeInit::Date(date),
+        }
+    }
+
+    fn schedule(self) -> js_sys::Date {
+        match self.init {
+            ScheduledTimeInit::Date(date) => date,
+            ScheduledTimeInit::Offset(offset_ms) => {
+                let now = Date::now().as_millis() as f64;
+                js_sys::Date::new(&Number::from(now + offset_ms))
+            }
+        }
+    }
+}
+
+impl From<i64> for ScheduledTime {
+    fn from(offset_ms: i64) -> Self {
+        ScheduledTime {
+            init: ScheduledTimeInit::Offset(offset_ms as f64),
+        }
+    }
+}
+
+impl From<DateTime<Utc>> for ScheduledTime {
+    fn from(date: DateTime<Utc>) -> Self {
+        ScheduledTime {
+            init: ScheduledTimeInit::Date(js_sys::Date::new(&Number::from(
+                date.timestamp_millis() as f64,
+            ))),
+        }
+    }
+}
+
+impl From<Duration> for ScheduledTime {
+    fn from(offset: Duration) -> Self {
+        ScheduledTime {
+            init: ScheduledTimeInit::Offset(offset.as_millis() as f64),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct GetAlarmOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_concurrency: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SetAlarmOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_concurrency: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_unconfirmed: Option<bool>,
+}
+
+impl EnvBinding for ObjectNamespace {
+    const TYPE_NAME: &'static str = "DurableObjectNamespace";
+}
+
+impl JsCast for ObjectNamespace {
+    fn instanceof(val: &JsValue) -> bool {
+        val.is_instance_of::<EdgeObjectNamespace>()
+    }
+
+    fn unchecked_from_js(val: JsValue) -> Self {
+        Self { inner: val.into() }
+    }
+
+    fn unchecked_from_js_ref(val: &JsValue) -> &Self {
+        unsafe { &*(val as *const JsValue as *const Self) }
+    }
+}
+
+impl From<ObjectNamespace> for JsValue {
+    fn from(ns: ObjectNamespace) -> Self {
+        JsValue::from(ns.inner)
+    }
+}
+
+impl AsRef<JsValue> for ObjectNamespace {
+    fn as_ref(&self) -> &JsValue {
+        &self.inner
+    }
+}
+
+#[derive(Debug)]
+pub enum WebSocketIncomingMessage {
+    String(String),
+    Binary(Vec<u8>),
+}
+
+/**
+**Note:** Implement this trait with a standard `impl DurableObject for YourType` block, but in order to
+integrate them with the Workers Runtime, you must also add the **`#[durable_object]`** attribute
+to the struct.
+
+## Example
+```no_run
+use worker::*;
+# struct User;
+# struct Message;
+
+#[durable_object]
+pub struct Chatroom {
+    users: Vec<User>,
+    messages: Vec<Message>,
+    state: State,
+    env: Env, // access `Env` across requests, use inside `fetch`
+}
+
+impl DurableObject for Chatroom {
+    fn new(state: State, env: Env) -> Self {
+        Self {
+            users: vec![],
+            messages: vec![],
+            state,
+            env,
+        }
+    }
+
+    async fn fetch(&self, _req: Request) -> Result<Response> {
+        // do some work when a worker makes a request to this DO
+        Response::ok(&format!("{} active users.", self.users.len()))
+    }
+}
+```
+*/
+#[allow(async_fn_in_trait)] // Send is not needed
+pub trait DurableObject: has_durable_object_attribute {
+    /// Constructs the Durable Object. This is synchronous; there is no async constructor. For async
+    /// setup, call [`State::block_concurrency_while`] here without awaiting it: the runtime blocks
+    /// delivery of all events until the initialization future completes.
+    fn new(state: State, env: Env) -> Self;
+
+    async fn fetch(&self, req: Request) -> Result<Response>;
+
+    /// Serves a TCP connection opened with [`Stub::connect`]. The socket is
+    /// closed when this future completes, so it must live for the whole
+    /// connection: when handing the socket to a listener, await
+    /// [`Socket::handle_as_node_connection`] rather than spawning it or
+    /// returning early.
+    #[allow(unused_variables, clippy::diverging_sub_expression)]
+    async fn connect(&self, socket: Socket) -> Result<()> {
+        worker_sys::console_error!("connect() handler not implemented");
+        unimplemented!("connect() handler")
+    }
+
+    #[allow(clippy::diverging_sub_expression)]
+    async fn alarm(&self) -> Result<Response> {
+        worker_sys::console_error!("alarm() handler not implemented");
+        unimplemented!("alarm() handler")
+    }
+
+    #[allow(unused_variables, clippy::diverging_sub_expression)]
+    async fn websocket_message(
+        &self,
+        ws: WebSocket,
+        message: WebSocketIncomingMessage,
+    ) -> Result<()> {
+        worker_sys::console_error!("websocket_message() handler not implemented");
+        unimplemented!("websocket_message() handler")
+    }
+
+    #[allow(unused_variables, clippy::diverging_sub_expression)]
+    async fn websocket_close(
+        &self,
+        ws: WebSocket,
+        code: usize,
+        reason: String,
+        was_clean: bool,
+    ) -> Result<()> {
+        worker_sys::console_error!("websocket_close() handler not implemented");
+        unimplemented!("websocket_close() handler")
+    }
+
+    #[allow(unused_variables, clippy::diverging_sub_expression)]
+    async fn websocket_error(&self, ws: WebSocket, error: Error) -> Result<()> {
+        worker_sys::console_error!("websocket_error() handler not implemented");
+        unimplemented!("websocket_error() handler")
+    }
+}
+
+#[doc(hidden)]
+#[allow(non_camel_case_types)]
+pub trait has_durable_object_attribute {}

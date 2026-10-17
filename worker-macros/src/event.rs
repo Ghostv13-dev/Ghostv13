@@ -1,0 +1,358 @@
+use crate::async_export::async_export_mod;
+use proc_macro::TokenStream;
+use quote::{format_ident, quote};
+use syn::{parse_macro_input, punctuated::Punctuated, token::Comma, Ident, ItemFn, Meta};
+
+#[derive(strum::EnumString, strum::Display)]
+#[strum(serialize_all = "snake_case")]
+enum HandlerType {
+    Fetch,
+    Scheduled,
+    Start,
+    #[cfg(feature = "queue")]
+    Queue,
+    Email,
+    Connect,
+}
+
+fn validate_event_fn(
+    input_fn: &ItemFn,
+    handler_type: HandlerType,
+    expected_params: usize,
+    must_be_async: bool,
+) {
+    let sig = &input_fn.sig;
+
+    if must_be_async != sig.asyncness.is_some() {
+        let not = if must_be_async { "" } else { " not" };
+        panic!("the `{handler_type}` handler must{not} be an async function");
+    }
+
+    let argument_word_form = if expected_params == 1 {
+        "argument"
+    } else {
+        "arguments"
+    };
+
+    let actual_params = sig.inputs.len();
+    if actual_params != expected_params {
+        panic!(
+            "the `{handler_type}` handler should be a function with {expected_params} {argument_word_form} but found {actual_params}"
+        );
+    }
+}
+
+pub fn expand_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let attrs: Punctuated<Meta, Comma> = parse_macro_input!(attr with Punctuated::parse_terminated);
+
+    use HandlerType::*;
+
+    let mut handler_type = None;
+    let mut respond_with_errors = false;
+    let mut udp_connect = false;
+
+    for attr in attrs {
+        match attr {
+            Meta::Path(path) => {
+                let attr = path
+                    .get_ident()
+                    .unwrap_or_else(|| panic!("Invalid event attribute"));
+                let attr_str = attr.to_string();
+                if attr_str == "respond_with_errors" {
+                    respond_with_errors = true;
+                } else if let Ok(ht) = attr_str.parse() {
+                    handler_type = Some(ht);
+                } else {
+                    panic!("Invalid attribute: {attr}");
+                }
+            }
+            Meta::List(list) if list.path.is_ident("connect") => {
+                let protocols = list
+                    .parse_args_with(Punctuated::<Ident, Comma>::parse_terminated)
+                    .unwrap_or_else(|_| panic!("invalid connect protocol"));
+                if protocols.len() != 1 || (protocols[0] != "tcp" && protocols[0] != "udp") {
+                    panic!("the supported connect protocols are `tcp` and `udp`");
+                }
+                handler_type = Some(Connect);
+                udp_connect = protocols[0] == "udp";
+            }
+            _ => panic!("Invalid event attribute"),
+        }
+    }
+    let handler_type = handler_type.expect(
+        "must have either 'fetch', 'scheduled', 'queue', 'email', 'connect', or 'start' attribute, e.g. #[event(fetch)]",
+    );
+
+    // create new var using syn item of the attributed fn
+    let mut input_fn = parse_macro_input!(item as ItemFn);
+
+    match handler_type {
+        Fetch => {
+            validate_event_fn(&input_fn, Fetch, 3, true);
+            // save original fn name for re-use in the wrapper fn
+            let input_fn_ident = Ident::new(
+                &(input_fn.sig.ident.to_string() + "_fetch_glue"),
+                input_fn.sig.ident.span(),
+            );
+            let wrapper_fn_ident = Ident::new("fetch", input_fn.sig.ident.span());
+            // rename the original attributed fn
+            input_fn.sig.ident = input_fn_ident.clone();
+
+            let error_handling = if respond_with_errors {
+                quote! { ::worker::Response::error(e.to_string(), 500).unwrap().into() }
+            } else {
+                quote! { ::worker::Response::error("INTERNAL SERVER ERROR", 500).unwrap().into() }
+            };
+
+            // create a new "main" function that takes the worker_sys::Request, and calls the
+            // original attributed function, passing in a converted worker::Request.
+            let glue = async_export_mod(
+                &format_ident!("_worker_fetch"),
+                quote! {
+                    use ::worker::wasm_bindgen;
+                    use super::#input_fn_ident;
+                },
+                quote! {
+                    #wrapper_fn_ident(
+                        req: ::worker::worker_sys::web_sys::Request,
+                        env: ::worker::Env,
+                        ctx: ::worker::worker_sys::Context
+                    )
+                },
+                quote! {
+                    let ctx = worker::Context::new(ctx);
+                    let response: ::worker::worker_sys::web_sys::Response = match ::worker::FromRequest::from_raw(req) {
+                        Ok(req) => {
+                            let result = #input_fn_ident(req, env, ctx).await;
+                            // get the worker::Result<worker::Response> by calling the original fn
+                            match result {
+                                Ok(raw_res) => {
+                                    match ::worker::IntoResponse::into_raw(raw_res) {
+                                        Ok(res) => res,
+                                        Err(err) => {
+                                            let e: Box<dyn std::error::Error> = err.into();
+                                            ::worker::console_error!("Error converting response: {}", &e);
+                                            #error_handling
+                                        }
+                                    }
+                                },
+                                Err(err) => {
+                                    let e: Box<dyn std::error::Error> = err.into();
+                                    ::worker::console_error!("{}", &e);
+                                    #error_handling
+                                }
+                            }
+                        },
+                        Err(err) => {
+                            let e: Box<dyn std::error::Error> = err.into();
+                            ::worker::console_error!("Error converting request: {}", &e);
+                            #error_handling
+                        }
+                    };
+                    Ok(::worker::wasm_bindgen::JsValue::from(response))
+                },
+            );
+
+            let output = quote! {
+                #input_fn
+                #glue
+            };
+
+            TokenStream::from(output)
+        }
+        Scheduled => {
+            validate_event_fn(&input_fn, Scheduled, 3, true);
+            // save original fn name for re-use in the wrapper fn
+            let input_fn_ident = Ident::new(
+                &(input_fn.sig.ident.to_string() + "_scheduled_glue"),
+                input_fn.sig.ident.span(),
+            );
+            let wrapper_fn_ident = Ident::new("scheduled", input_fn.sig.ident.span());
+            // rename the original attributed fn
+            input_fn.sig.ident = input_fn_ident.clone();
+
+            let glue = async_export_mod(
+                &format_ident!("_worker_scheduled"),
+                quote! {
+                    use ::worker::wasm_bindgen;
+                    use super::#input_fn_ident;
+                },
+                quote! {
+                    #wrapper_fn_ident(event: ::worker::worker_sys::ScheduledEvent, env: ::worker::Env, ctx: ::worker::worker_sys::ScheduleContext)
+                },
+                quote! {
+                    // call the original fn
+                    #input_fn_ident(::worker::ScheduledEvent::from(event), env, ::worker::ScheduleContext::from(ctx)).await;
+                    Ok(::worker::wasm_bindgen::JsValue::UNDEFINED)
+                },
+            );
+
+            let output = quote! {
+                #input_fn
+                #glue
+            };
+
+            TokenStream::from(output)
+        }
+        #[cfg(feature = "queue")]
+        Queue => {
+            validate_event_fn(&input_fn, Queue, 3, true);
+            // save original fn name for re-use in the wrapper fn
+            let input_fn_ident = Ident::new(
+                &(input_fn.sig.ident.to_string() + "_queue_glue"),
+                input_fn.sig.ident.span(),
+            );
+            let wrapper_fn_ident = Ident::new("queue", input_fn.sig.ident.span());
+            // rename the original attributed fn
+            input_fn.sig.ident = input_fn_ident.clone();
+
+            let glue = async_export_mod(
+                &format_ident!("_worker_queue"),
+                quote! {
+                    use ::worker::wasm_bindgen;
+                    use super::#input_fn_ident;
+                },
+                quote! {
+                    #wrapper_fn_ident(event: ::worker::worker_sys::MessageBatch, env: ::worker::Env, ctx: ::worker::worker_sys::Context)
+                },
+                quote! {
+                    // call the original fn
+                    let ctx = worker::Context::new(ctx);
+                    match #input_fn_ident(::worker::MessageBatch::from(event), env, ctx).await {
+                        Ok(()) => {},
+                        Err(e) => {
+                            ::worker::console_log!("{}", &e);
+                            panic!("{}", e);
+                        }
+                    }
+                    Ok(::worker::wasm_bindgen::JsValue::UNDEFINED)
+                },
+            );
+
+            let output = quote! {
+                #input_fn
+                #glue
+            };
+
+            TokenStream::from(output)
+        }
+        Start => {
+            validate_event_fn(&input_fn, Start, 0, false);
+
+            let mod_name = Ident::new(
+                &format!("_worker_start_{}", input_fn.sig.ident),
+                input_fn.sig.ident.span(),
+            );
+
+            let wasm_bindgen_code =
+                wasm_bindgen_macro_support::expand(quote! { start }, quote! { #input_fn })
+                    .expect("wasm_bindgen macro failed to expand");
+
+            let output = quote! {
+                mod #mod_name {
+                    pub use ::worker::wasm_bindgen;
+                }
+                use #mod_name::*;
+                #wasm_bindgen_code
+            };
+
+            TokenStream::from(output)
+        }
+        Email => {
+            validate_event_fn(&input_fn, Email, 3, true);
+            let input_fn_ident = Ident::new(
+                &(input_fn.sig.ident.to_string() + "_email_glue"),
+                input_fn.sig.ident.span(),
+            );
+            let wrapper_fn_ident = Ident::new("email", input_fn.sig.ident.span());
+            // rename the original attributed fn
+            input_fn.sig.ident = input_fn_ident.clone();
+
+            let glue = async_export_mod(
+                &format_ident!("_worker_email"),
+                quote! {
+                    use ::worker::wasm_bindgen;
+                    use super::#input_fn_ident;
+                },
+                quote! {
+                    #wrapper_fn_ident(message: ::worker::ForwardableEmailMessage, env: ::worker::Env, ctx: ::worker::worker_sys::Context)
+                },
+                quote! {
+                    let ctx = worker::Context::new(ctx);
+                    match #input_fn_ident(message, env, ctx).await {
+                        Ok(()) => {},
+                        Err(e) => {
+                            ::worker::console_log!("{}", &e);
+                            panic!("{}", e);
+                        }
+                    }
+                    Ok(::worker::wasm_bindgen::JsValue::UNDEFINED)
+                },
+            );
+
+            let output = quote! {
+                #input_fn
+                #glue
+            };
+            TokenStream::from(output)
+        }
+        Connect => {
+            validate_event_fn(&input_fn, Connect, 3, true);
+            // save original fn name for re-use in the wrapper fn
+            let input_fn_ident = Ident::new(
+                &(input_fn.sig.ident.to_string() + "_connect_glue"),
+                input_fn.sig.ident.span(),
+            );
+            let wrapper_fn_ident = Ident::new(
+                if udp_connect {
+                    "connect_udp"
+                } else {
+                    "connect"
+                },
+                input_fn.sig.ident.span(),
+            );
+            let module_ident = Ident::new(
+                &format!("_worker_{wrapper_fn_ident}"),
+                input_fn.sig.ident.span(),
+            );
+            // rename the original attributed fn
+            input_fn.sig.ident = input_fn_ident.clone();
+
+            let glue = async_export_mod(
+                &module_ident,
+                quote! {
+                    use ::worker::wasm_bindgen;
+                    use super::#input_fn_ident;
+                },
+                quote! {
+                    #wrapper_fn_ident(
+                        socket: ::worker::worker_sys::Socket,
+                        env: ::worker::Env,
+                        ctx: ::worker::worker_sys::Context
+                    )
+                },
+                quote! {
+                    let ctx = worker::Context::new(ctx);
+                    // A failed connection rejects, closing only that socket.
+                    match ::worker::FromSocket::from_raw(socket) {
+                        Ok(socket) => match #input_fn_ident(socket, env, ctx).await {
+                            Ok(()) => Ok(::worker::wasm_bindgen::JsValue::UNDEFINED),
+                            Err(e) => Err(::worker::wasm_bindgen::JsValue::from(e)),
+                        },
+                        Err(err) => {
+                            let e: Box<dyn std::error::Error> = err.into();
+                            Err(::worker::js_sys::Error::new(&format!("Error converting socket: {e}")).into())
+                        }
+                    }
+                },
+            );
+
+            let output = quote! {
+                #input_fn
+                #glue
+            };
+
+            TokenStream::from(output)
+        }
+    }
+}

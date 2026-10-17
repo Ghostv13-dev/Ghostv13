@@ -1,0 +1,5 @@
+name = "router-on-workers"
+main = "build/index.js"
+
+[build]
+command = "cargo install \"worker-build@^0.8\" && worker-build --release"

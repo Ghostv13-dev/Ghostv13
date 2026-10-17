@@ -1,0 +1,21 @@
+name = "queue-on-workers"
+main = "build/index.js"
+
+[build]
+command = "cargo install \"worker-build@^0.8\" && worker-build --release"
+
+[[queues.consumers]]
+queue = "mymessages"
+dead_letter_queue = "mymessagesdlq"
+
+[[queues.consumers]]
+queue = "rawmessages"
+
+
+[[queues.producers]]
+queue = "mymessages"
+binding = "my_messages"
+
+[[queues.producers]]
+queue = "rawmessages"
+binding = "raw_messages"

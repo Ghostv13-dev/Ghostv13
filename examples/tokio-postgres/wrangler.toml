@@ -1,0 +1,9 @@
+name = "hyperdrive-test"
+main = "build/index.js"
+
+[[hyperdrive]]
+binding = "DB"
+id = ""
+
+[build]
+command = "cargo install \"worker-build@^0.8\" && worker-build --release"
